@@ -129,6 +129,10 @@ class ArxivRetriever(BaseRetriever):
             for i in feed.entries
             if i.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
+        all_paper_ids = [paper_id.strip() for paper_id in all_paper_ids if paper_id and paper_id.strip()]
+        if not all_paper_ids:
+            logger.warning("No valid arXiv paper IDs found; skipping the API request.")
+            return raw_papers
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
@@ -141,11 +145,12 @@ class ArxivRetriever(BaseRetriever):
 
         try:
             for i in range(0, len(all_paper_ids), batch_size):
-                search = arxiv.Search(id_list=all_paper_ids[i : i + batch_size])
+                batch_ids = all_paper_ids[i : i + batch_size]
                 batch_number = i // batch_size
 
                 for attempt in range(max_batch_retries):
                     try:
+                        search = arxiv.Search(id_list=batch_ids)
                         batch = list(client.results(search))
                         bar.update(len(batch))
                         raw_papers.extend(batch)
