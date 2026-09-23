@@ -118,7 +118,6 @@ class ArxivRetriever(BaseRetriever):
         client = arxiv.Client(page_size=10, num_retries=3, delay_seconds=10)
         query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if "Feed error for query" in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
@@ -136,7 +135,6 @@ class ArxivRetriever(BaseRetriever):
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api.
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 10
         batch_retry_delay = 30
@@ -150,7 +148,10 @@ class ArxivRetriever(BaseRetriever):
 
                 for attempt in range(max_batch_retries):
                     try:
-                        search = arxiv.Search(id_list=batch_ids)
+                        # arxiv.Search(id_list=...) can still generate an empty `search_query`
+                        # in some library versions, which arXiv rejects with HTTP 406.
+                        # Use a valid query plus the ID list to keep the request accepted.
+                        search = arxiv.Search(query="all:*", id_list=batch_ids)
                         batch = list(client.results(search))
                         bar.update(len(batch))
                         raw_papers.extend(batch)
