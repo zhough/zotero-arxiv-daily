@@ -114,12 +114,13 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        client = arxiv.Client(num_retries=10, delay_seconds=10)
-        query = '+'.join(self.config.source.arxiv.category)
+        # Keep requests small and slow enough to avoid arXiv API throttling.
+        client = arxiv.Client(page_size=10, num_retries=3, delay_seconds=10)
+        query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         # Get the latest paper from arxiv rss feed
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
-        if 'Feed error for query' in feed.feed.title:
+        if "Feed error for query" in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
         raw_papers = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
@@ -131,28 +132,45 @@ class ArxivRetriever(BaseRetriever):
         if self.config.executor.debug:
             all_paper_ids = all_paper_ids[:10]
 
-        # Get full information of each paper from arxiv api
+        # Get full information of each paper from arxiv api.
         bar = tqdm(total=len(all_paper_ids))
         max_batch_retries = 10
         batch_retry_delay = 30
-        for i in range(0, len(all_paper_ids), 20):
-            search = arxiv.Search(id_list=all_paper_ids[i:i + 20])
-            for attempt in range(max_batch_retries):
-                try:
-                    batch = list(client.results(search))
-                    bar.update(len(batch))
-                    raw_papers.extend(batch)
-                    break
-                except arxiv.HTTPError as exc:
-                    if exc.status == 429 and attempt < max_batch_retries - 1:
-                        wait = batch_retry_delay * (attempt + 1)
-                        logger.warning(f"arXiv API 429 on batch {i // 20}, retry {attempt + 1}/{max_batch_retries} in {wait}s")
+        batch_size = 10
+        retryable_statuses = {403, 406, 429, 500, 502, 503, 504}
+
+        try:
+            for i in range(0, len(all_paper_ids), batch_size):
+                search = arxiv.Search(id_list=all_paper_ids[i : i + batch_size])
+                batch_number = i // batch_size
+
+                for attempt in range(max_batch_retries):
+                    try:
+                        batch = list(client.results(search))
+                        bar.update(len(batch))
+                        raw_papers.extend(batch)
+                        break
+                    except arxiv.HTTPError as exc:
+                        if exc.status not in retryable_statuses:
+                            raise
+                        if attempt == max_batch_retries - 1:
+                            logger.error(
+                                f"arXiv API failed for batch {batch_number} after "
+                                f"{max_batch_retries} attempts: HTTP {exc.status}"
+                            )
+                            raise
+
+                        wait = min(300, batch_retry_delay * (2**attempt))
+                        logger.warning(
+                            f"arXiv API returned HTTP {exc.status} on batch {batch_number}; "
+                            f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
+                        )
                         sleep(wait)
-                    else:
-                        raise
-            if i + 20 < len(all_paper_ids):
-                sleep(3)
-        bar.close()
+
+                if i + batch_size < len(all_paper_ids):
+                    sleep(10)
+        finally:
+            bar.close()
 
         return raw_papers
 
