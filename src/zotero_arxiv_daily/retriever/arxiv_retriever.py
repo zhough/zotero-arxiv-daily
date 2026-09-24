@@ -148,10 +148,10 @@ class ArxivRetriever(BaseRetriever):
 
                 for attempt in range(max_batch_retries):
                     try:
-                        # arxiv.Search(id_list=...) can still generate an empty `search_query`
-                        # in some library versions, which arXiv rejects with HTTP 406.
-                        # Use a valid query plus the ID list to keep the request accepted.
-                        search = arxiv.Search(query="all:*", id_list=batch_ids)
+                        # arXiv rejects requests that include an empty or over-broad
+                        # `search_query` together with an `id_list`. The supported form is
+                        # `id_list` by itself, without a `query` argument.
+                        search = arxiv.Search(id_list=batch_ids)
                         batch = list(client.results(search))
                         bar.update(len(batch))
                         raw_papers.extend(batch)
