@@ -106,38 +106,31 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
-def _coerce_result_from_entry(entry: Any) -> Any:
-    entry_id = entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
-    if not entry_id:
-        raise ValueError("Missing arXiv entry id")
-
-    paper_id = entry_id.rsplit("/", 1)[-1]
+def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
+    """Convert a parsed arXiv Atom entry back into the library's native Result object."""
+    title = getattr(entry, "title", None) or ""
+    summary = getattr(entry, "summary", None) or ""
+    authors = getattr(entry, "authors", []) or []
+    entry_id = getattr(entry, "id", None) or ""
     pdf_url = None
-    for link in entry.get("links", []) if isinstance(entry, dict) else getattr(entry, "links", []):
-        href = link.get("href") if isinstance(link, dict) else getattr(link, "href", None)
+    for link in getattr(entry, "links", []) or []:
+        href = getattr(link, "href", None)
         if href and "/pdf/" in href:
             pdf_url = href
             break
 
-    authors = []
-    raw_authors = entry.get("authors", []) if isinstance(entry, dict) else getattr(entry, "authors", [])
-    for author in raw_authors:
-        if isinstance(author, dict):
-            name = author.get("name")
-        elif hasattr(author, "name"):
-            name = author.name
-        else:
-            name = str(author)
-        if name:
-            authors.append(type("Author", (), {"name": name})())
+    # Prefer the library's own conversion method if it exists.
+    if hasattr(arxiv.Result, "from_entry"):
+        return arxiv.Result.from_entry(entry)
 
-    result = type("ArxivResult", (), {})()
-    result.title = entry.get("title") if isinstance(entry, dict) else getattr(entry, "title", "")
-    result.summary = entry.get("summary") if isinstance(entry, dict) else getattr(entry, "summary", "")
+    # Fallback for older / alternative library shapes.
+    result = type("FallbackResult", (), {})()
+    result.title = title
+    result.summary = summary
     result.authors = authors
     result.entry_id = entry_id
     result.pdf_url = pdf_url
-    result.source_url = lambda: f"https://export.arxiv.org/e-print/{paper_id}"
+    result.source_url = lambda: entry_id.replace("/abs/", "/src/") if "/abs/" in entry_id else None
     return result
 
 
@@ -150,14 +143,13 @@ class ArxivRetriever(BaseRetriever):
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         # Keep requests small and slow enough to avoid arXiv API throttling.
-        # NOTE: using the raw API request avoids the python-arxiv bug where Search(id_list=...)
-        # serializes an empty `search_query` parameter, which arXiv rejects with HTTP 406.
         query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
         if "Feed error for query" in feed.feed.title:
             raise Exception(f"Invalid ARXIV_QUERY: {query}.")
-        raw_papers = []
+
+        raw_papers: list[ArxivResult] = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
         all_paper_ids = [
             i.id.removeprefix("oai:arXiv.org:")
@@ -192,7 +184,10 @@ class ArxivRetriever(BaseRetriever):
                         )
                         response.raise_for_status()
                         parsed = feedparser.parse(response.content)
-                        batch = [_coerce_result_from_entry(entry) for entry in parsed.entries]
+                        batch = [_entry_to_arxiv_result(entry) for entry in parsed.entries]
+                        logger.info(
+                            f"Batch {batch_number}: fetched {len(parsed.entries)} entries, converted {len(batch)} results"
+                        )
                         bar.update(len(batch))
                         raw_papers.extend(batch)
                         break
@@ -213,6 +208,9 @@ class ArxivRetriever(BaseRetriever):
                             f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
                         )
                         sleep(wait)
+                    except Exception as exc:
+                        logger.warning(f"Skipping arXiv batch {batch_number}: {type(exc).__name__}: {exc}")
+                        break
 
                 if i + batch_size < len(all_paper_ids):
                     sleep(10)
