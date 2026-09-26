@@ -99,7 +99,7 @@ def load_records():
 
 ArxivRetriever._retrieve_raw_papers = lambda self: load_records()
 
-from zotero_arxiv_daily.main import main  # noqa: E402
-
 if __name__ == "__main__":
-    main()
+    import runpy
+
+    runpy.run_path("src/zotero_arxiv_daily/main.py", run_name="__main__")
