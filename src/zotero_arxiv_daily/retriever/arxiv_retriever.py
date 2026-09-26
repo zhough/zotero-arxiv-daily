@@ -5,11 +5,9 @@ from ..protocol import Paper
 from ..utils import extract_markdown_from_pdf, extract_tex_code_from_tar
 from tempfile import TemporaryDirectory
 import feedparser
-from tqdm import tqdm
 import multiprocessing
 import os
 from queue import Empty
-from time import sleep
 from typing import Any, Callable, TypeVar
 from loguru import logger
 import requests
@@ -107,31 +105,27 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
 
 
 def _entry_to_arxiv_result(entry: Any) -> ArxivResult:
-    """Convert a parsed arXiv Atom entry back into the library's native Result object."""
-    title = getattr(entry, "title", None) or ""
-    summary = getattr(entry, "summary", None) or ""
-    authors = getattr(entry, "authors", []) or []
-    entry_id = getattr(entry, "id", None) or ""
-    pdf_url = None
-    for link in getattr(entry, "links", []) or []:
-        href = getattr(link, "href", None)
-        if href and "/pdf/" in href:
-            pdf_url = href
-            break
+    """Build an arxiv.Result from the metadata in an arXiv announcement feed."""
+    paper_id = entry.get("id", "").removeprefix("oai:arXiv.org:").strip()
+    title = entry.get("title", "").strip()
+    summary = entry.get("summary", "")
+    creator = entry.get("author", "")
+    if not paper_id or not title or "Abstract:" not in summary or not creator:
+        raise ValueError(f"Incomplete arXiv RSS entry: {paper_id or '<missing ID>'}")
 
-    # Prefer the library's own conversion method if it exists.
-    if hasattr(arxiv.Result, "from_entry"):
-        return arxiv.Result.from_entry(entry)
-
-    # Fallback for older / alternative library shapes.
-    result = type("FallbackResult", (), {})()
-    result.title = title
-    result.summary = summary
-    result.authors = authors
-    result.entry_id = entry_id
-    result.pdf_url = pdf_url
-    result.source_url = lambda: entry_id.replace("/abs/", "/src/") if "/abs/" in entry_id else None
-    return result
+    abstract = summary.split("Abstract:", 1)[1].strip()
+    authors = [
+        arxiv.Result.Author(name.strip())
+        for name in creator.split(",")
+        if name.strip()
+    ]
+    return arxiv.Result(
+        entry_id=entry.get("link") or f"https://arxiv.org/abs/{paper_id}",
+        title=title,
+        authors=authors,
+        summary=abstract,
+        links=[arxiv.Result.Link(href=f"https://arxiv.org/pdf/{paper_id}", title="pdf")],
+    )
 
 
 @register_retriever("arxiv")
@@ -142,82 +136,29 @@ class ArxivRetriever(BaseRetriever):
             raise ValueError("category must be specified for arxiv.")
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
-        # Keep requests small and slow enough to avoid arXiv API throttling.
         query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
-        feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
+        response = requests.get(
+            f"https://rss.arxiv.org/atom/{query}",
+            headers={"User-Agent": "zotero-arxiv-daily/1.0"},
+            timeout=(10, 60),
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        if feed.bozo or not feed.feed.get("title"):
+            raise ValueError(f"Invalid arXiv Atom feed for {query}: {feed.get('bozo_exception', 'missing title')}")
         if "Feed error for query" in feed.feed.title:
-            raise Exception(f"Invalid ARXIV_QUERY: {query}.")
+            raise ValueError(f"Invalid ARXIV_QUERY: {query}.")
 
-        raw_papers: list[ArxivResult] = []
         allowed_announce_types = {"new", "cross"} if include_cross_list else {"new"}
-        all_paper_ids = [
-            i.id.removeprefix("oai:arXiv.org:")
-            for i in feed.entries
-            if i.get("arxiv_announce_type", "new") in allowed_announce_types
+        entries = [
+            entry for entry in feed.entries
+            if entry.get("arxiv_announce_type", "new") in allowed_announce_types
         ]
-        all_paper_ids = [paper_id.strip() for paper_id in all_paper_ids if paper_id and paper_id.strip()]
-        if not all_paper_ids:
-            logger.warning("No valid arXiv paper IDs found; skipping the API request.")
-            return raw_papers
         if self.config.executor.debug:
-            all_paper_ids = all_paper_ids[:10]
-
-        bar = tqdm(total=len(all_paper_ids))
-        max_batch_retries = 10
-        batch_retry_delay = 30
-        batch_size = 10
-        retryable_statuses = {403, 406, 429, 500, 502, 503, 504}
-
-        try:
-            for i in range(0, len(all_paper_ids), batch_size):
-                batch_ids = all_paper_ids[i : i + batch_size]
-                batch_number = i // batch_size
-
-                for attempt in range(max_batch_retries):
-                    try:
-                        response = requests.get(
-                            "https://export.arxiv.org/api/query",
-                            params={"id_list": ",".join(batch_ids)},
-                            headers={"User-Agent": "zotero-arxiv-daily/1.0"},
-                            timeout=(10, 60),
-                        )
-                        response.raise_for_status()
-                        parsed = feedparser.parse(response.content)
-                        batch = [_entry_to_arxiv_result(entry) for entry in parsed.entries]
-                        logger.info(
-                            f"Batch {batch_number}: fetched {len(parsed.entries)} entries, converted {len(batch)} results"
-                        )
-                        bar.update(len(batch))
-                        raw_papers.extend(batch)
-                        break
-                    except requests.RequestException as exc:
-                        status = getattr(exc.response, "status_code", None)
-                        if status not in retryable_statuses:
-                            raise
-                        if attempt == max_batch_retries - 1:
-                            logger.error(
-                                f"arXiv API failed for batch {batch_number} after "
-                                f"{max_batch_retries} attempts: HTTP {status}"
-                            )
-                            raise
-
-                        wait = min(300, batch_retry_delay * (2**attempt))
-                        logger.warning(
-                            f"arXiv API returned HTTP {status} on batch {batch_number}; "
-                            f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
-                        )
-                        sleep(wait)
-                    except Exception as exc:
-                        logger.warning(f"Skipping arXiv batch {batch_number}: {type(exc).__name__}: {exc}")
-                        break
-
-                if i + batch_size < len(all_paper_ids):
-                    sleep(10)
-        finally:
-            bar.close()
-
-        return raw_papers
+            entries = entries[:10]
+        logger.info(f"arXiv RSS returned {len(feed.entries)} entries; selected {len(entries)} announcements")
+        return [_entry_to_arxiv_result(entry) for entry in entries]
 
     def convert_to_paper(self, raw_paper: ArxivResult) -> Paper:
         title = raw_paper.title
