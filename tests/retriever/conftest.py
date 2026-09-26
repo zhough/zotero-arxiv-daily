@@ -8,8 +8,8 @@ import pytest
 def mock_feedparser(monkeypatch):
     """Patch feedparser.parse to return the local RSS fixture for arXiv URLs.
 
-    The arxiv library passes bytes (response.content) to feedparser.parse,
-    so we check for both str and bytes URL types.
+    The test provides RSS response bytes through a mocked HTTP request.
+    Other callers may still parse the fixture URL directly.
 
     Returns the parsed result so tests can assert against it.
     """
