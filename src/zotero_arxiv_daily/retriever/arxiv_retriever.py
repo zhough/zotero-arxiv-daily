@@ -106,6 +106,41 @@ def _extract_text_from_tar_worker(source_url: str, paper_id: str, paper_title: s
         return file_contents["all"]
 
 
+def _coerce_result_from_entry(entry: Any) -> Any:
+    entry_id = entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
+    if not entry_id:
+        raise ValueError("Missing arXiv entry id")
+
+    paper_id = entry_id.rsplit("/", 1)[-1]
+    pdf_url = None
+    for link in entry.get("links", []) if isinstance(entry, dict) else getattr(entry, "links", []):
+        href = link.get("href") if isinstance(link, dict) else getattr(link, "href", None)
+        if href and "/pdf/" in href:
+            pdf_url = href
+            break
+
+    authors = []
+    raw_authors = entry.get("authors", []) if isinstance(entry, dict) else getattr(entry, "authors", [])
+    for author in raw_authors:
+        if isinstance(author, dict):
+            name = author.get("name")
+        elif hasattr(author, "name"):
+            name = author.name
+        else:
+            name = str(author)
+        if name:
+            authors.append(type("Author", (), {"name": name})())
+
+    result = type("ArxivResult", (), {})()
+    result.title = entry.get("title") if isinstance(entry, dict) else getattr(entry, "title", "")
+    result.summary = entry.get("summary") if isinstance(entry, dict) else getattr(entry, "summary", "")
+    result.authors = authors
+    result.entry_id = entry_id
+    result.pdf_url = pdf_url
+    result.source_url = lambda: f"https://export.arxiv.org/e-print/{paper_id}"
+    return result
+
+
 @register_retriever("arxiv")
 class ArxivRetriever(BaseRetriever):
     def __init__(self, config):
@@ -115,7 +150,8 @@ class ArxivRetriever(BaseRetriever):
 
     def _retrieve_raw_papers(self) -> list[ArxivResult]:
         # Keep requests small and slow enough to avoid arXiv API throttling.
-        client = arxiv.Client(page_size=10, num_retries=3, delay_seconds=10)
+        # NOTE: using the raw API request avoids the python-arxiv bug where Search(id_list=...)
+        # serializes an empty `search_query` parameter, which arXiv rejects with HTTP 406.
         query = "+".join(self.config.source.arxiv.category)
         include_cross_list = self.config.source.arxiv.get("include_cross_list", False)
         feed = feedparser.parse(f"https://rss.arxiv.org/atom/{query}")
@@ -148,27 +184,32 @@ class ArxivRetriever(BaseRetriever):
 
                 for attempt in range(max_batch_retries):
                     try:
-                        # arXiv rejects requests that include an empty or over-broad
-                        # `search_query` together with an `id_list`. The supported form is
-                        # `id_list` by itself, without a `query` argument.
-                        search = arxiv.Search(id_list=batch_ids)
-                        batch = list(client.results(search))
+                        response = requests.get(
+                            "https://export.arxiv.org/api/query",
+                            params={"id_list": ",".join(batch_ids)},
+                            headers={"User-Agent": "zotero-arxiv-daily/1.0"},
+                            timeout=(10, 60),
+                        )
+                        response.raise_for_status()
+                        parsed = feedparser.parse(response.content)
+                        batch = [_coerce_result_from_entry(entry) for entry in parsed.entries]
                         bar.update(len(batch))
                         raw_papers.extend(batch)
                         break
-                    except arxiv.HTTPError as exc:
-                        if exc.status not in retryable_statuses:
+                    except requests.RequestException as exc:
+                        status = getattr(exc.response, "status_code", None)
+                        if status not in retryable_statuses:
                             raise
                         if attempt == max_batch_retries - 1:
                             logger.error(
                                 f"arXiv API failed for batch {batch_number} after "
-                                f"{max_batch_retries} attempts: HTTP {exc.status}"
+                                f"{max_batch_retries} attempts: HTTP {status}"
                             )
                             raise
 
                         wait = min(300, batch_retry_delay * (2**attempt))
                         logger.warning(
-                            f"arXiv API returned HTTP {exc.status} on batch {batch_number}; "
+                            f"arXiv API returned HTTP {status} on batch {batch_number}; "
                             f"retry {attempt + 1}/{max_batch_retries} in {wait}s"
                         )
                         sleep(wait)
