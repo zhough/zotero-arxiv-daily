@@ -1,11 +1,6 @@
 name: Send emails daily
 on:
   workflow_dispatch:
-    inputs:
-      replay_20260923:
-        description: 'Send the 2026-09-23 paper digest'
-        type: boolean
-        default: false
   schedule:
     - cron: '47 19 * * *'
 
@@ -36,8 +31,4 @@ jobs:
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
-          if [ "${{ inputs.replay_20260923 }}" = "true" ]; then
-            uv run replay_20260923.py
-          else
-            uv run src/zotero_arxiv_daily/main.py
-          fi
+          uv run src/zotero_arxiv_daily/main.py
