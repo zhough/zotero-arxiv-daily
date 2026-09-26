@@ -1,9 +1,11 @@
 """Tests for ArxivRetriever."""
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
-import feedparser
+import pytest
+import requests
 
 from zotero_arxiv_daily.retriever.arxiv_retriever import ArxivRetriever, _run_with_hard_timeout
 import zotero_arxiv_daily.retriever.arxiv_retriever as arxiv_retriever
@@ -20,36 +22,18 @@ def _raise_runtime_error() -> None:
 
 def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
     monkeypatch.setattr("zotero_arxiv_daily.retriever.base.sleep", lambda _: None)
+    rss_xml = Path("tests/retriever/arxiv_rss_example.xml").read_bytes()
+    calls = []
 
-    # The RSS fixture gives us paper IDs.  After feedparser, the code calls
-    # arxiv.Client().results(search) which makes real HTTP requests.  We mock
-    # the arxiv Client so the test stays offline.
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(content=rss_xml, raise_for_status=lambda: None)
+
+    monkeypatch.setattr(arxiv_retriever.requests, "get", fake_get)
     new_entries = [
         e for e in mock_feedparser.entries
         if e.get("arxiv_announce_type", "new") == "new"
     ]
-    paper_ids = [e.id.removeprefix("oai:arXiv.org:") for e in new_entries]
-
-    # Build fake ArxivResult-like objects matching each RSS entry
-    fake_results = []
-    for entry in new_entries:
-        pid = entry.id.removeprefix("oai:arXiv.org:")
-        fake_results.append(SimpleNamespace(
-            title=entry.title,
-            authors=[SimpleNamespace(name="Test Author")],
-            summary="Test abstract",
-            pdf_url=f"https://arxiv.org/pdf/{pid}",
-            entry_id=f"https://arxiv.org/abs/{pid}",
-            source_url=lambda pid=pid: f"https://arxiv.org/e-print/{pid}",
-        ))
-
-    class FakeClient:
-        def __init__(self, **kw):
-            pass
-        def results(self, search):
-            return iter(fake_results)
-
-    monkeypatch.setattr(arxiv_retriever.arxiv, "Client", FakeClient)
 
     # Skip file downloads in convert_to_paper
     monkeypatch.setattr(arxiv_retriever, "extract_text_from_html", lambda paper: None)
@@ -61,6 +45,32 @@ def test_arxiv_retriever(config, mock_feedparser, monkeypatch):
 
     assert len(papers) == len(new_entries)
     assert set(p.title for p in papers) == set(e.title for e in new_entries)
+    assert papers[0].authors == ["Alice Smith", "Bob Jones"]
+    assert papers[0].abstract == "We propose a neural architecture search method for efficient transformers."
+    assert papers[0].pdf_url == "https://arxiv.org/pdf/2508.14001v1"
+    assert calls == ["https://rss.arxiv.org/atom/cs.AI+cs.CV"]
+    result = arxiv_retriever._entry_to_arxiv_result(new_entries[0])
+    assert isinstance(result, arxiv_retriever.arxiv.Result)
+    assert result.source_url() == "https://arxiv.org/src/2508.14001v1"
+
+
+def test_arxiv_retriever_empty_feed(config, monkeypatch):
+    empty_feed = b'<feed xmlns="http://www.w3.org/2005/Atom"><title>cs.AI updates</title></feed>'
+    monkeypatch.setattr(
+        arxiv_retriever.requests,
+        "get",
+        lambda url, **kwargs: SimpleNamespace(content=empty_feed, raise_for_status=lambda: None),
+    )
+    assert ArxivRetriever(config)._retrieve_raw_papers() == []
+
+
+def test_arxiv_retriever_rejects_failed_rss_request(config, monkeypatch):
+    def failed_get(url, **kwargs):
+        raise requests.HTTPError("RSS unavailable")
+
+    monkeypatch.setattr(arxiv_retriever.requests, "get", failed_get)
+    with pytest.raises(requests.HTTPError, match="RSS unavailable"):
+        ArxivRetriever(config)._retrieve_raw_papers()
 
 
 def test_run_with_hard_timeout_returns_value():
