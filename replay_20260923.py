@@ -79,7 +79,7 @@ def load_records():
         metadata = records[paper_id]
         author_nodes = metadata.findall("{*}authors/{*}author")
         authors = [
-            arxiv.Result.Author(" ".join(filter(None, [value(a, "forenames"), value(a, "keyname")]))))
+            arxiv.Result.Author(" ".join(filter(None, [value(a, "forenames"), value(a, "keyname")])))
             for a in author_nodes
         ]
         title = value(metadata, "title")
