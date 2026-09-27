@@ -1,6 +1,15 @@
 name: Send emails daily
 on:
   workflow_dispatch:
+    inputs:
+      backfill_date:
+        description: 'One-off missed daily digest'
+        type: choice
+        options:
+          - normal
+          - '2026-09-24'
+          - '2026-09-25'
+        default: normal
   schedule:
     - cron: '47 19 * * *'
 
@@ -31,4 +40,8 @@ jobs:
           printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
           echo "Use custom config: "
           cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+          if [ "${{ inputs.backfill_date }}" = "2026-09-24" ] || [ "${{ inputs.backfill_date }}" = "2026-09-25" ]; then
+            BACKFILL_DATE="${{ inputs.backfill_date }}" uv run replay_backfill.py
+          else
+            uv run src/zotero_arxiv_daily/main.py
+          fi
