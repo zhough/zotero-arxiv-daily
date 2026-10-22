@@ -142,6 +142,10 @@ def glob_match(path:str, pattern:str) -> bool:
 def send_email(config:DictConfig, html:str):
     sender = config.email.sender
     receiver = config.email.receiver
+    cc = config.email.get("cc") or []
+    if isinstance(cc, str):
+        cc = [cc]
+    cc = [address.strip() for address in cc if address and address.strip()]
     password = config.email.sender_password
     smtp_server = config.email.smtp_server
     smtp_port = config.email.smtp_port
@@ -152,6 +156,8 @@ def send_email(config:DictConfig, html:str):
     msg = MIMEText(html, 'html', 'utf-8')
     msg['From'] = _format_addr('Github Action <%s>' % sender)
     msg['To'] = _format_addr('You <%s>' % receiver)
+    if cc:
+        msg['Cc'] = ', '.join(_format_addr(address) for address in cc)
     today = datetime.datetime.now().strftime('%Y/%m/%d')
     msg['Subject'] = Header(f'Daily arXiv {today}', 'utf-8').encode()
 
@@ -167,5 +173,6 @@ def send_email(config:DictConfig, html:str):
             server = smtplib.SMTP(smtp_server, smtp_port)
 
     server.login(sender, password)
-    server.sendmail(sender, [receiver], msg.as_string())
+    recipients = list(dict.fromkeys([receiver, *cc]))
+    server.sendmail(sender, recipients, msg.as_string())
     server.quit()
