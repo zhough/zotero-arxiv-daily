@@ -2,11 +2,17 @@ name: Send emails daily
 on:
   workflow_dispatch:
   schedule:
-    - cron: '37 19 * * *'
+    # 14:17 Asia/Shanghai, after arXiv RSS's midnight EST update (13:00 CST).
+    - cron: '17 6 * * *'
+
+concurrency:
+  group: daily-paper-email
+  cancel-in-progress: false
 
 jobs:
   calculate-and-send:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -17,7 +23,79 @@ jobs:
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
 
+      - name: Prepare config
+        env:
+          CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
+        run: printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
+
+      - name: Wait for current arXiv announcements
+        id: arxiv-feed
+        run: |
+          uv run python - <<'PY'
+          import os
+          import time
+          import urllib.request
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timedelta, timezone
+          from omegaconf import OmegaConf
+
+          config = OmegaConf.merge(
+              OmegaConf.load('config/base.yaml'),
+              OmegaConf.load('config/custom.yaml'),
+          )
+          ready = True
+          message = 'arXiv is not an enabled source; using the normal pipeline.'
+          if 'arxiv' in config.executor.source:
+              categories = config.source.arxiv.category
+              if not categories:
+                  raise ValueError('No arXiv categories configured')
+              query = '+'.join(categories)
+              url = f'https://rss.arxiv.org/atom/{query}'
+              atom = '{http://www.w3.org/2005/Atom}'
+              arxiv = '{http://arxiv.org/schemas/atom}'
+              allowed = {'new', 'cross'} if config.source.arxiv.get('include_cross_list', False) else {'new'}
+              beijing = timezone(timedelta(hours=8))
+              today = datetime.now(beijing).date()
+              ready = False
+              for attempt in range(1, 4):
+                  try:
+                      request = urllib.request.Request(
+                          url, headers={'User-Agent': 'zotero-arxiv-daily/1.0', 'Cache-Control': 'no-cache'},
+                      )
+                      with urllib.request.urlopen(request, timeout=70) as response:
+                          feed = ET.fromstring(response.read())
+                      title = feed.findtext(atom + 'title', '')
+                      if feed.tag != atom + 'feed' or not title or 'Feed error for query' in title:
+                          raise ValueError('Invalid arXiv Atom feed')
+                      updated = datetime.fromisoformat(feed.findtext(atom + 'updated', '').replace('Z', '+00:00'))
+                      if updated.tzinfo is None or updated.astimezone(beijing).date() != today:
+                          raise ValueError('arXiv feed has not updated for today')
+                      count = sum(
+                          entry.findtext(arxiv + 'announce_type', 'new') in allowed
+                          for entry in feed.findall(atom + 'entry')
+                      )
+                      message = f'arXiv feed: {count} matching announcements (attempt {attempt}/3).'
+                      print(message)
+                      if count:
+                          ready = True
+                          break
+                      if attempt == 3:
+                          message += ' No email sent; valid empty feed after three checks (possible non-announcement day).'
+                  except Exception as exc:
+                      print(f'arXiv feed check {attempt}/3 failed: {type(exc).__name__}: {exc}')
+                      if attempt == 3:
+                          raise
+                  if attempt < 3:
+                      print('Retrying the feed in 10 minutes; email sending has not started.')
+                      time.sleep(600)
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'ready={str(ready).lower()}\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write(message + '\n')
+          PY
+
       - name: Run script
+        if: steps.arxiv-feed.outputs.ready == 'true'
         env:
           ZOTERO_ID: ${{ secrets.ZOTERO_ID }}
           ZOTERO_KEY: ${{ secrets.ZOTERO_KEY }}
@@ -26,9 +104,4 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
-          CUSTOM_CONFIG: ${{ vars.CUSTOM_CONFIG }}
-        run: |
-          printf "%b\n" "$CUSTOM_CONFIG" > config/custom.yaml
-          echo "Use custom config: "
-          cat config/custom.yaml
-          uv run src/zotero_arxiv_daily/main.py
+        run: uv run src/zotero_arxiv_daily/main.py
